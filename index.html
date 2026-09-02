@@ -1,0 +1,438 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Physical Tracking Egg Catcher</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #111827;
+            color: white;
+            font-family: sans-serif;
+        }
+
+        .slider-container {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            font-size: 0.8rem;
+            margin-bottom: 4px;
+        }
+
+        input[type=range] {
+            width: 60%;
+        }
+
+        #webcam {
+            display: none;
+        }
+    </style>
+</head>
+
+<body class="flex flex-col md:flex-row h-screen w-screen">
+
+    <!-- Sidebar: Calibration & Computer Vision -->
+    <div class="w-full md:w-[350px] bg-gray-900 p-4 border-r border-gray-700 flex flex-col gap-4 overflow-y-auto">
+        <h1 class="text-xl font-bold text-blue-400">CV Tracker</h1>
+
+        <div id="statusPanel" class="bg-gray-800 p-3 rounded-lg text-sm border border-gray-600">
+            <span id="statusText" class="text-yellow-400">Loading OpenCV.js (~10MB)...</span>
+        </div>
+
+        <button id="startBtn" disabled
+            class="bg-blue-600 hover:bg-blue-500 text-white font-bold py-2 px-4 rounded opacity-50 cursor-not-allowed transition-colors">
+            1. Start Camera
+        </button>
+
+        <p id="calibrationHelp" class="text-xs hidden text-green-400 font-semibold">
+            CLICK ON YOUR OBJECT in the Camera View below to auto-calibrate. Then adjust sliders if needed until ONLY your object is WHITE in the Mask View.
+        </p>
+
+        <button id="startGameBtn"
+            class="bg-green-600 hover:bg-green-500 text-white font-bold py-2 px-4 rounded hidden transition-colors">
+            2. Start Game
+        </button>
+
+        <!-- Video Feeds -->
+        <div class="flex flex-col gap-2">
+            <div>
+                <span class="text-xs text-gray-400">Camera View (Mirrored)</span>
+                <canvas id="camCanvas" width="320" height="240"
+                    class="w-full rounded bg-black border border-gray-700 transform -scale-x-100 cursor-crosshair"></canvas>
+            </div>
+            <div>
+                <span class="text-xs text-gray-400">Mask View (White = Tracked)</span>
+                <canvas id="maskCanvas" width="320" height="240"
+                    class="w-full rounded bg-black border border-gray-700 transform -scale-x-100"></canvas>
+            </div>
+        </div>
+
+        <!-- Calibration Sliders -->
+        <div class="bg-gray-800 p-3 rounded-lg flex flex-col gap-1 border border-gray-700">
+            <h2 class="text-sm font-semibold mb-2">HSV Calibration</h2>
+            <div class="slider-container"><label>Hue Min</label><input type="range" id="hMin" min="0" max="180"
+                    value="90"><span id="hMinVal">90</span></div>
+            <div class="slider-container"><label>Hue Max</label><input type="range" id="hMax" min="0" max="180"
+                    value="130"><span id="hMaxVal">130</span></div>
+            <div class="slider-container"><label>Sat Min</label><input type="range" id="sMin" min="0" max="255"
+                    value="100"><span id="sMinVal">100</span></div>
+            <div class="slider-container"><label>Sat Max</label><input type="range" id="sMax" min="0" max="255"
+                    value="255"><span id="sMaxVal">255</span></div>
+            <div class="slider-container"><label>Val Min</label><input type="range" id="vMin" min="0" max="255"
+                    value="100"><span id="vMinVal">100</span></div>
+            <div class="slider-container"><label>Val Max</label><input type="range" id="vMax" min="0" max="255"
+                    value="255"><span id="vMaxVal">255</span></div>
+            <button id="presetBlueBtn" class="mt-2 text-xs bg-gray-700 hover:bg-gray-600 p-1 rounded">Reset to Blue
+                Preset</button>
+        </div>
+    </div>
+
+    <!-- Main Content: Game -->
+    <div class="flex-1 relative bg-gray-950 flex flex-col">
+        <!-- Hidden actual video element used for streaming -->
+        <video id="webcam" width="320" height="240" autoplay playsinline></video>
+
+        <div class="absolute top-4 left-4 z-10 flex gap-4 text-2xl font-bold select-none text-white drop-shadow-md">
+            <div>Score: <span id="scoreUI" class="text-green-400">0</span></div>
+            <div>Missed: <span id="missUI" class="text-red-400">0</span></div>
+        </div>
+
+        <!-- The actual game canvas -->
+        <canvas id="gameCanvas" class="w-full h-full block"></canvas>
+    </div>
+
+    <!-- Load OpenCV.js -->
+    <script async src="https://docs.opencv.org/4.8.0/opencv.js" onload="onOpenCvReady();"
+        type="text/javascript"></script>
+
+    <script>
+        // --- 1. UI & State Setup ---
+        const startBtn = document.getElementById('startBtn');
+        const startGameBtn = document.getElementById('startGameBtn');
+        const calibrationHelp = document.getElementById('calibrationHelp');
+        const statusText = document.getElementById('statusText');
+        const video = document.getElementById('webcam');
+        const camCanvas = document.getElementById('camCanvas');
+        const camCtx = camCanvas.getContext('2d');
+        const gameCanvas = document.getElementById('gameCanvas');
+        const gameCtx = gameCanvas.getContext('2d');
+
+        let streaming = false;
+        let cvReady = false;
+        let gameStarted = false;
+        let trackedXRatio = 0.5; // 0.0 to 1.0 (center default)
+
+        // Calibration Default: Tracks Blue Objects (e.g. blue bottle cap)
+        const trackerState = { hMin: 90, hMax: 130, sMin: 100, sMax: 255, vMin: 100, vMax: 255 };
+
+        // Bind Sliders
+        ['hMin', 'hMax', 'sMin', 'sMax', 'vMin', 'vMax'].forEach(id => {
+            const el = document.getElementById(id);
+            const valEl = document.getElementById(id + 'Val');
+            el.addEventListener('input', (e) => {
+                trackerState[id] = parseInt(e.target.value);
+                valEl.innerText = e.target.value;
+            });
+        });
+
+        document.getElementById('presetBlueBtn').addEventListener('click', () => {
+            document.getElementById('hMin').value = 90; trackerState.hMin = 90; document.getElementById('hMinVal').innerText = 90;
+            document.getElementById('hMax').value = 130; trackerState.hMax = 130; document.getElementById('hMaxVal').innerText = 130;
+            document.getElementById('sMin').value = 100; trackerState.sMin = 100; document.getElementById('sMinVal').innerText = 100;
+            document.getElementById('sMax').value = 255; trackerState.sMax = 255; document.getElementById('sMaxVal').innerText = 255;
+            document.getElementById('vMin').value = 100; trackerState.vMin = 100; document.getElementById('vMinVal').innerText = 100;
+            document.getElementById('vMax').value = 255; trackerState.vMax = 255; document.getElementById('vMaxVal').innerText = 255;
+        });
+
+        // --- 2. OpenCV Initialization ---
+        function onOpenCvReady() {
+            // OpenCV.js needs a moment to initialize its WASM module
+            cv['onRuntimeInitialized'] = () => {
+                cvReady = true;
+                statusText.innerText = 'OpenCV Ready! Click "Start Camera".';
+                statusText.className = 'text-green-400 font-bold';
+                startBtn.disabled = false;
+                startBtn.classList.remove('opacity-50', 'cursor-not-allowed');
+            };
+        }
+
+        // --- 3. Camera & Setup ---
+        startBtn.addEventListener('click', async () => {
+            if (!cvReady) return;
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 320, height: 240, frameRate: { ideal: 60 } }, audio: false });
+                video.srcObject = stream;
+                video.play();
+                streaming = true;
+                startBtn.style.display = 'none';
+                
+                calibrationHelp.classList.remove('hidden');
+                startGameBtn.classList.remove('hidden');
+                statusText.innerText = 'Camera Active. Please calibrate.';
+
+                // Start Processing Loops
+                requestAnimationFrame(processVideoFrame);
+                
+                // Draw initial message on game canvas
+                resizeGame();
+                gameCtx.fillStyle = '#10B981';
+                gameCtx.font = '30px sans-serif';
+                gameCtx.textAlign = 'center';
+                gameCtx.fillText('Calibrate tracking on the left, then click Start Game', gameCanvas.width / 2, gameCanvas.height / 2);
+            } catch (err) {
+                statusText.innerText = 'Camera Error: ' + err.message;
+                statusText.className = 'text-red-400';
+            }
+        });
+
+        startGameBtn.addEventListener('click', () => {
+            if (!streaming || gameStarted) return;
+            gameStarted = true;
+            startGameBtn.style.display = 'none';
+            calibrationHelp.innerText = "Game Running. You can still adjust sliders if needed.";
+            calibrationHelp.classList.remove('text-green-400');
+            calibrationHelp.classList.add('text-gray-400');
+            statusText.innerText = 'Tracking Active.';
+            initGame();
+        });
+
+        // Auto-calibration via click on camera canvas
+        camCanvas.addEventListener('click', (e) => {
+            if (!cvReady || !streaming || !hsvMat) return;
+            
+            const rect = camCanvas.getBoundingClientRect();
+            const scaleX = camCanvas.width / rect.width;
+            const scaleY = camCanvas.height / rect.height;
+
+            let x = (e.clientX - rect.left) * scaleX;
+            let y = (e.clientY - rect.top) * scaleY;
+
+            // Adjust for horizontally flipped canvas
+            x = camCanvas.width - x; 
+            
+            x = Math.max(0, Math.min(camCanvas.width - 1, Math.floor(x)));
+            y = Math.max(0, Math.min(camCanvas.height - 1, Math.floor(y)));
+
+            const pixel = hsvMat.ucharPtr(y, x);
+            const h = pixel[0];
+            const s = pixel[1];
+            const v = pixel[2];
+
+            // Provide a window around the clicked color
+            const hMin = Math.max(0, h - 15);
+            const hMax = Math.min(180, h + 15);
+            const sMin = Math.max(0, s - 50);
+            const sMax = 255;
+            const vMin = Math.max(0, v - 50);
+            const vMax = 255;
+
+            trackerState.hMin = hMin;
+            trackerState.hMax = hMax;
+            trackerState.sMin = sMin;
+            trackerState.sMax = sMax;
+            trackerState.vMin = vMin;
+            trackerState.vMax = vMax;
+
+            document.getElementById('hMin').value = hMin; document.getElementById('hMinVal').innerText = hMin;
+            document.getElementById('hMax').value = hMax; document.getElementById('hMaxVal').innerText = hMax;
+            document.getElementById('sMin').value = sMin; document.getElementById('sMinVal').innerText = sMin;
+            document.getElementById('sMax').value = sMax; document.getElementById('sMaxVal').innerText = sMax;
+            document.getElementById('vMin').value = vMin; document.getElementById('vMinVal').innerText = vMin;
+            document.getElementById('vMax').value = vMax; document.getElementById('vMaxVal').innerText = vMax;
+            
+            // Highlight sliders to show they updated
+            ['hMin', 'hMax', 'sMin', 'sMax', 'vMin', 'vMax'].forEach(id => {
+                const el = document.getElementById(id + 'Val');
+                el.classList.add('text-green-400');
+                setTimeout(() => el.classList.remove('text-green-400'), 1000);
+            });
+        });
+
+        // --- 4. Computer Vision Loop ---
+        let srcMat, hsvMat, maskMat, lowScalar, highScalar;
+
+        function processVideoFrame() {
+            if (!streaming) return;
+
+            // Initialize Mats on first frame
+            if (!srcMat) {
+                srcMat = new cv.Mat(video.height, video.width, cv.CV_8UC4);
+                hsvMat = new cv.Mat(video.height, video.width, cv.CV_8UC3);
+                maskMat = new cv.Mat(video.height, video.width, cv.CV_8UC1);
+            }
+
+            // Draw video to our input canvas (CV reads from here or video directly)
+            camCtx.drawImage(video, 0, 0, 320, 240);
+
+            // Read pixel data into OpenCV Matrix
+            let cap = new cv.VideoCapture(video);
+            cap.read(srcMat);
+
+            // Convert to HSV color space
+            cv.cvtColor(srcMat, hsvMat, cv.COLOR_RGBA2RGB);
+            cv.cvtColor(hsvMat, hsvMat, cv.COLOR_RGB2HSV);
+
+            // Create threshold bounds based on sliders
+            // OpenCV.js requires Mat objects for inRange
+            let low = new cv.Mat(hsvMat.rows, hsvMat.cols, hsvMat.type(), [trackerState.hMin, trackerState.sMin, trackerState.vMin, 0]);
+            let high = new cv.Mat(hsvMat.rows, hsvMat.cols, hsvMat.type(), [trackerState.hMax, trackerState.sMax, trackerState.vMax, 255]);
+
+            // Apply color filter (threshold)
+            cv.inRange(hsvMat, low, high, maskMat);
+
+            // Cleanup bound Mats to prevent memory leak
+            low.delete(); high.delete();
+
+            // Find Contours (Blobs)
+            let contours = new cv.MatVector();
+            let hierarchy = new cv.Mat();
+            cv.findContours(maskMat, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+            let maxArea = 0;
+            let maxContourIndex = -1;
+
+            // Find the largest blob
+            for (let i = 0; i < contours.size(); ++i) {
+                let cnt = contours.get(i);
+                let area = cv.contourArea(cnt);
+                if (area > maxArea) {
+                    maxArea = area;
+                    maxContourIndex = i;
+                }
+                cnt.delete();
+            }
+
+            // If we found a substantial blob
+            if (maxContourIndex !== -1 && maxArea > 200) {
+                let cnt = contours.get(maxContourIndex);
+                let moments = cv.moments(cnt, false);
+                let cx = moments.m10 / moments.m00; // X centroid in camera coords (0 to 320)
+
+                // Map to ratio. Note: Webcam is mirrored, so we invert X.
+                trackedXRatio = 1.0 - (cx / 320);
+                cnt.delete();
+            }
+
+            contours.delete();
+            hierarchy.delete();
+
+            // Draw the mask to the debug canvas so the user can calibrate
+            cv.imshow('maskCanvas', maskMat);
+
+            // Loop
+            requestAnimationFrame(processVideoFrame);
+        }
+
+        // --- 5. Game Logic ---
+        let eggs = [];
+        let score = 0;
+        let missed = 0;
+        let basket = { x: 0, targetX: 0, y: 0, width: 140, height: 40 };
+        let lastTime = 0;
+        let spawnTimer = 0;
+
+        function resizeGame() {
+            gameCanvas.width = gameCanvas.parentElement.clientWidth;
+            gameCanvas.height = gameCanvas.parentElement.clientHeight;
+            basket.y = gameCanvas.height - 60;
+        }
+        window.addEventListener('resize', resizeGame);
+
+        function spawnEgg() {
+            eggs.push({
+                x: Math.random() * (gameCanvas.width - 40) + 20,
+                y: -30,
+                radius: 15,
+                speed: 3 + Math.random() * 4,
+                color: ['#FCD34D', '#F87171', '#60A5FA', '#34D399'][Math.floor(Math.random() * 4)]
+            });
+        }
+
+        function initGame() {
+            resizeGame();
+            basket.x = gameCanvas.width / 2;
+            requestAnimationFrame(gameLoop);
+        }
+
+        function gameLoop(timestamp) {
+            const dt = timestamp - lastTime;
+            lastTime = timestamp;
+
+            // Clear Canvas
+            gameCtx.clearRect(0, 0, gameCanvas.width, gameCanvas.height);
+
+            // Draw background grid (optional aesthetics)
+            gameCtx.strokeStyle = 'rgba(255, 255, 255, 0.05)';
+            gameCtx.beginPath();
+            for (let i = 0; i < gameCanvas.width; i += 50) { gameCtx.moveTo(i, 0); gameCtx.lineTo(i, gameCanvas.height); }
+            for (let j = 0; j < gameCanvas.height; j += 50) { gameCtx.moveTo(0, j); gameCtx.lineTo(gameCanvas.width, j); }
+            gameCtx.stroke();
+
+            // Update Basket Position (Lerp for smooth movement)
+            basket.targetX = trackedXRatio * gameCanvas.width - (basket.width / 2);
+            // Ensure it stays on screen
+            basket.targetX = Math.max(0, Math.min(gameCanvas.width - basket.width, basket.targetX));
+            // Smooth follow
+            basket.x += (basket.targetX - basket.x) * 0.2;
+
+            // Draw Basket (Physical representation on screen)
+            gameCtx.fillStyle = '#10B981'; // Green basket
+            gameCtx.beginPath();
+            gameCtx.roundRect(basket.x, basket.y, basket.width, basket.height, 10);
+            gameCtx.fill();
+            gameCtx.fillStyle = '#065F46';
+            gameCtx.fillRect(basket.x + 10, basket.y + 10, basket.width - 20, basket.height - 20);
+
+            // Spawn logic
+            spawnTimer += dt;
+            if (spawnTimer > 1000) {
+                spawnEgg();
+                spawnTimer = 0;
+            }
+
+            // Update & Draw Eggs
+            for (let i = eggs.length - 1; i >= 0; i--) {
+                let egg = eggs[i];
+                egg.y += egg.speed;
+
+                // Draw Egg
+                gameCtx.fillStyle = egg.color;
+                gameCtx.beginPath();
+                gameCtx.ellipse(egg.x, egg.y, egg.radius, egg.radius * 1.3, 0, 0, Math.PI * 2);
+                gameCtx.fill();
+                // Egg highlight
+                gameCtx.fillStyle = 'rgba(255,255,255,0.4)';
+                gameCtx.beginPath();
+                gameCtx.ellipse(egg.x - 4, egg.y - 6, 4, 6, Math.PI / 4, 0, Math.PI * 2);
+                gameCtx.fill();
+
+                // Collision Detection
+                // Check if egg bottom is inside the basket area
+                if (egg.y + egg.radius >= basket.y && egg.y - egg.radius <= basket.y + basket.height) {
+                    if (egg.x >= basket.x && egg.x <= basket.x + basket.width) {
+                        // Caught!
+                        score++;
+                        document.getElementById('scoreUI').innerText = score;
+                        eggs.splice(i, 1);
+                        continue;
+                    }
+                }
+
+                // Missed Detection
+                if (egg.y - egg.radius > gameCanvas.height) {
+                    missed++;
+                    document.getElementById('missUI').innerText = missed;
+                    eggs.splice(i, 1);
+                }
+            }
+
+            requestAnimationFrame(gameLoop);
+        }
+    </script>
+</body>
+
+</html>
